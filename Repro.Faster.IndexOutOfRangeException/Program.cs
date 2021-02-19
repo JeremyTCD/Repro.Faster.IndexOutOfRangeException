@@ -1,7 +1,8 @@
 ﻿using FASTER.core;
 using System;
+using System.Diagnostics;
+using System.Threading;
 using System.Threading.Tasks;
-using Xunit;
 
 namespace Repro.Faster.IndexOutOfRangeException
 {
@@ -10,35 +11,48 @@ namespace Repro.Faster.IndexOutOfRangeException
         public static async Task Main()
         {
             var mixedStorageDictionary = new MixedStorageDictionary<int, string>();
-            int numRecords = 1000;
-            string dummyRecordValue = "dummyString";
+            int numRecords = 20_000_000;
 
-            // Concurrent upserts
-            var upsertTasks = new Task[numRecords];
-            for (int i = 0; i < numRecords; i++)
-            {
-                int key = i;
-                upsertTasks[i] = Task.Run(() => mixedStorageDictionary.Upsert(key, dummyRecordValue));
-            }
-            await Task.WhenAll(upsertTasks).ConfigureAwait(false);
+            Parallel.For(0, numRecords, key => mixedStorageDictionary.Upsert(key, "dummyString"));
 
-            // Concurrent reads
-            var readTasks = new Task<(Status, string)>[numRecords];
-            for (int i = 0; i < numRecords; i++)
-            {
-                readTasks[i] = mixedStorageDictionary.ReadAsync(i).AsTask();
-            }
-            await Task.WhenAll(readTasks).ConfigureAwait(false);
+            Console.WriteLine("upsert done");
 
-            // Assert
-            for (int i = 0; i < numRecords; i++)
+            int issueParallel = 4; // vary this to increase read issue parallelism
+            Task[] tasks = new Task[issueParallel];
+            Random[] r = new Random[issueParallel];
+            for (int i = 0; i < issueParallel; i++)
+                r[i] = new Random(i);
+
+            int cnt = 0;
+            Stopwatch sw = new Stopwatch();
+            sw.Start();
+            while (true)
             {
-                (Status status, string result) = readTasks[i].Result;
-                Assert.Equal(Status.OK, status);
-                Assert.Equal(dummyRecordValue, result);
+                for (int i = 0; i < issueParallel; i++)
+                    tasks[i] = ReadIssuer(r[i]);
+                Task.WaitAll(tasks);
             }
 
-            Console.WriteLine("Success!");
+            async Task ReadIssuer(Random r)
+            {
+                await Task.Yield();
+
+                int batchSize = 1000;
+                var readTasks = new ValueTask<(Status, string)>[batchSize];
+                for (int i = 0; i < batchSize; i++)
+                {
+                    readTasks[i] = mixedStorageDictionary.ReadAsync(r.Next(numRecords));
+                }
+                for (int i = 0; i < batchSize; i++)
+                    await readTasks[i].ConfigureAwait(false);
+
+                if (Interlocked.Increment(ref cnt) % 1000 == 0)
+                {
+                    sw.Stop();
+                    Console.WriteLine($"Time for {1000 * batchSize} ops = {sw.ElapsedMilliseconds}ms");
+                    sw.Restart();
+                }
+            }
         }
     }
 }
